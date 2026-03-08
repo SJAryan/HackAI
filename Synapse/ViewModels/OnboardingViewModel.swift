@@ -1,175 +1,168 @@
 import SwiftUI
-import PDFKit
 
 @MainActor
-class OnboardingViewModel: ObservableObject {
+final class OnboardingViewModel: ObservableObject {
     @Published var step: Int = 1
     
-    // Step 1: Resume Upload
     @Published var isParsingPDF: Bool = false
     @Published var pdfStatusMessage: String = ""
     @Published var rawPdfText: String = ""
+    @Published var errorMessage: String = ""
     
-    // Step 2 & 3: Questionnaire Answers
     @Published var currentSkills: String = ""
     @Published var futureInterests: String = ""
     @Published var suggestedRole: String = ""
     @Published var selectedTrack: String = "Prompt Engineering"
     @Published var starMastery: Int = 3
     
-    // Matchmaker Integration
     @Published var isMatching: Bool = false
     @Published var matchedSession: GameSession? = nil
     
-    let tracks = ["Prompt Engineering", "AI Safety", "Privacy", "AI Dev"]
+    let tracks = ["Prompt Engineering", "AI Safety", "AI Agents", "Responsible AI", "Backend Systems"]
     
-    // MARK: - PDF Parsing & Gemini Prefill
+    private let localUserId = UUID().uuidString
     
-    func parsePDFAndExtract(url: URL) {
-        guard url.startAccessingSecurityScopedResource() else {
-            self.pdfStatusMessage = "❌ Access denied to file."
-            return
-        }
-        
-        defer {
-            url.stopAccessingSecurityScopedResource()
-        }
-        
-        if let pdfDoc = PDFDocument(url: url) {
-            var fullText = ""
-            for i in 0..<pdfDoc.pageCount {
-                if let page = pdfDoc.page(at: i), let pageText = page.string {
-                    fullText += pageText + "\\n"
-                }
-            }
-            
-            self.rawPdfText = fullText
-            let wordCount = fullText.split { $0.isWhitespace || $0.isNewline }.count
-            self.pdfStatusMessage = "✅ Dossier Acquired (\\(wordCount) words). Running AI Extraction..."
-            self.isParsingPDF = true
-            
-            Task {
-                do {
-                    let parsedData = try await ResumeParserService.shared.parseResume(pdfText: fullText)
-                    await MainActor.run {
-                        self.currentSkills = parsedData.currentSkills.joined(separator: ", ")
-                        self.futureInterests = parsedData.futureInterests.joined(separator: ", ")
-                        self.suggestedRole = parsedData.suggestedRole
-                        self.isParsingPDF = false
-                        self.step = 2 // Auto-advance to Questionnaire
-                    }
-                } catch {
-                    await MainActor.run {
-                        self.pdfStatusMessage = "⚠️ Extraction failed. Please manually enter your intel."
-                        self.isParsingPDF = false
-                        self.step = 2 // Advance anyway
-                    }
-                }
-            }
-            
-        } else {
-            self.pdfStatusMessage = "❌ Failed to read PDF contents."
-        }
+    private func applyDossier(_ dossier: UserDossier, statusMessage: String) {
+        rawPdfText = rawPdfText.isEmpty ? dossier.atlasSearchText : rawPdfText
+        currentSkills = dossier.currentSkills.joined(separator: ", ")
+        futureInterests = dossier.futureInterests.joined(separator: ", ")
+        suggestedRole = dossier.suggestedRole
+        starMastery = dossier.trackMastery
+        isParsingPDF = false
+        pdfStatusMessage = statusMessage
+        step = 2
     }
     
-    // MARK: - Final Submit to Matchmaker
-    
-    func submitDossierAndMatch() {
-        self.isMatching = true
+    func parsePDFAndExtract(url: URL) {
+        isParsingPDF = true
+        pdfStatusMessage = "DOSSIER INGESTION IN PROGRESS..."
+        errorMessage = ""
         
         Task {
             do {
-                print("[API] Submitting full Operative Dossier for Vector Matchmaking...")
-                guard let url = URL(string: "http://localhost:3000/match") else { return }
+                let fullText = try ResumeParserService.shared.extractText(from: url)
+                let wordCount = fullText.split(whereSeparator: \.isWhitespace).count
+                let parsedDossier: UserDossier
                 
-                let requestBody: [String: Any] = [
-                    "userId": "kevin_123", // Or dynamic user ID
-                    "skills": currentSkills,
-                    "interests": futureInterests,
-                    "role": suggestedRole.isEmpty ? selectedTrack : suggestedRole,
-                    "trackMastery": starMastery
-                ]
-                let jsonData = try JSONSerialization.data(withJSONObject: requestBody)
-                
-                var request = URLRequest(url: url)
-                request.httpMethod = "POST"
-                request.addValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.httpBody = jsonData
-                
-                let (data, response) = try await URLSession.shared.data(for: request)
-                
-                guard let httpResponse = response as? HTTPURLResponse, 
-                      (200...299).contains(httpResponse.statusCode) else {
-                    throw URLError(.badServerResponse)
+                if AppRuntime.isDemoMode {
+                    parsedDossier = DemoDataFactory.dossier(id: localUserId)
+                } else {
+                    parsedDossier = try await withTimeout {
+                        try await ResumeParserService.shared.parseResume(pdfText: fullText)
+                    }
                 }
                 
-                let jsonResult = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
-                let status = jsonResult?["status"] as? String ?? ""
-                
-                if status == "success" {
-                    let peerId = jsonResult?["peerId"] as? String ?? "Unknown Peer"
-                    let peerBio = jsonResult?["peerBio"] as? String ?? "No bio"
-                    let peerMastery = jsonResult?["peerMastery"] as? Int ?? 3
-                    
-                    print("SUCCESS: Matched! Peer Bio: \\(peerBio)")
-                    let prompt = "Create a cooperative puzzle. The topic is \\(selectedTrack). Player A's skills: \\(currentSkills), interests: \\(futureInterests). Player B's bio: \\(peerBio)."
-                    
-                    var sessionToStart: GameSession
-                    do {
-                        sessionToStart = try await GeminiService.shared.generateSkillModule(prompt: prompt)
-                    } catch {
-                        sessionToStart = GameSession(id: UUID().uuidString, topic: selectedTrack, playerAId: "kevin_123", playerBId: peerId, startTime: Date(), isActive: true, currentLevel: 1, clues: ["Fallback Clue 1", "Fallback Clue 2"], expectedAnswer: "API", peerMastery: peerMastery)
-                    }
-                    
-                    sessionToStart.id = UUID().uuidString
-                    sessionToStart.playerAId = "kevin_123"
-                    sessionToStart.playerBId = peerId
-                    sessionToStart.peerMastery = peerMastery
-                    
-                    await MainActor.run {
-                        self.isMatching = false
-                        self.matchedSession = sessionToStart
-                    }
-                } else {
-                    await MainActor.run {
-                        self.isMatching = false
-                        print("WAITING: Dossier securely lodged in Atlas vector state.")
-                    }
+                DispatchQueue.main.async {
+                    self.rawPdfText = fullText
+                    self.applyDossier(parsedDossier, statusMessage: "DOSSIER PARSED: \(wordCount) WORDS EXTRACTED.")
                 }
             } catch {
-                await MainActor.run {
-                    self.isMatching = false
-                    print("[ERROR] Database/Vector Search Failed: \(error.localizedDescription)")
+                DispatchQueue.main.async {
+                    self.applyDossier(DemoDataFactory.dossier(id: self.localUserId), statusMessage: "DOSSIER PARSED: FALLBACK INTELLIGENCE LOADED.")
                 }
+            }
+        }
+    }
+    
+    private func parseCSVLine(_ value: String) -> [String] {
+        value
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+    
+    func buildDossier() -> UserDossier {
+        var interests = parseCSVLine(futureInterests)
+        if !interests.contains(selectedTrack) {
+            interests.insert(selectedTrack, at: 0)
+        }
+        
+        return UserDossier(
+            id: localUserId,
+            currentSkills: parseCSVLine(currentSkills),
+            futureInterests: interests,
+            suggestedRole: suggestedRole.isEmpty ? "Adaptive Operative" : suggestedRole,
+            trackMastery: starMastery
+        )
+    }
+    
+    func submitDossierAndMatch() {
+        let dossier = buildDossier()
+        isMatching = true
+        errorMessage = ""
+        
+        Task {
+            let assignedRole: OperativeRole = Bool.random() ? .controls : .intel
+            do {
+                let match: MatchmakerResponse
+                if AppRuntime.isDemoMode {
+                    match = DemoDataFactory.matchResponse(for: dossier)
+                } else {
+                    match = try await withTimeout {
+                        try await MatchmakerService.shared.findMatch(for: dossier)
+                    }
+                }
+                
+                guard match.status == "success" else {
+                    throw URLError(.resourceUnavailable)
+                }
+                
+                let session: GameSession
+                if AppRuntime.isDemoMode {
+                    var mockSession = DemoDataFactory.mission(for: dossier, assignedRole: assignedRole)
+                    mockSession.peerSuggestedRole = match.peerRole
+                    mockSession.peerSummary = match.peerSummary
+                    mockSession.matchScore = match.matchScore
+                    session = mockSession
+                } else {
+                    let missionPrompt = """
+                    Build a 15-minute asymmetric co-op learning mission.
+                    Topic: \(match.trackTopic ?? selectedTrack)
+                    Local dossier: \(dossier.atlasSearchText)
+                    Matched peer role: \(match.peerRole ?? "Unknown")
+                    Matched peer summary: \(match.peerSummary ?? "No peer summary provided.")
+                    The local player's assigned role should be \(assignedRole.rawValue).
+                    """
+                    
+                    session = try await withTimeout {
+                        try await GeminiService.shared.generateSkillModule(prompt: missionPrompt)
+                    }
+                }
+                
+                var hydratedSession = session
+                hydratedSession.sessionId = hydratedSession.sessionId.isEmpty ? UUID().uuidString : hydratedSession.sessionId
+                hydratedSession.playerA_Id = localUserId
+                hydratedSession.playerB_Id = match.peerId ?? "pending-peer"
+                hydratedSession.trackTopic = match.trackTopic ?? selectedTrack
+                hydratedSession.localAssignedRole = assignedRole
+                hydratedSession.startedAt = Date()
+                hydratedSession.isComplete = false
+                hydratedSession.peerSuggestedRole = match.peerRole
+                hydratedSession.peerSummary = match.peerSummary
+                hydratedSession.matchScore = match.matchScore
+                
+                DispatchQueue.main.async {
+                    self.isMatching = false
+                    self.matchedSession = hydratedSession
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.errorMessage = ""
+                }
+                simulateMatch()
             }
         }
     }
     
     func simulateMatch() {
-        self.isMatching = true
-        
-        // Simulating the delay for "Vector Sync"
+        isMatching = true
         Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            let dossier = buildDossier()
+            var mockSession = DemoDataFactory.mission(for: dossier, assignedRole: .controls)
+            mockSession.trackTopic = selectedTrack
             
-            let mockSession = GameSession(
-                id: UUID().uuidString,
-                topic: selectedTrack,
-                playerAId: "kevin_123",
-                playerBId: "SIM_OPERATIVE_007",
-                startTime: Date(),
-                isActive: true,
-                currentLevel: 1,
-                clues: [
-                    "It's a foundational concept in Prompt Engineering.",
-                    "Involves providing examples to the model within the prompt.",
-                    "The number of 'shots' refers to the number of examples provided."
-                ],
-                expectedAnswer: "Few-Shot Prompting",
-                peerMastery: 4
-            )
-            
-            await MainActor.run {
+            DispatchQueue.main.async {
                 self.isMatching = false
                 self.matchedSession = mockSession
             }

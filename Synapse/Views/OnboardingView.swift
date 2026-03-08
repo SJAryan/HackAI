@@ -20,7 +20,9 @@ struct OnboardingView: View {
                 VStack(spacing: 30) {
                     headerView
                     
-                    if viewModel.step == 1 {
+                    if viewModel.isMatching {
+                        targetSecuredLoadingView
+                    } else if viewModel.step == 1 {
                         step1View
                     } else {
                         step2View
@@ -49,7 +51,7 @@ struct OnboardingView: View {
                                 .background(viewModel.isMatching ? Color.gray : accentColor)
                                 .cornerRadius(8)
                             }
-                            .disabled(viewModel.isMatching || viewModel.currentSkills.isEmpty)
+                            .disabled(viewModel.isMatching || viewModel.currentSkills.isEmpty || viewModel.futureInterests.isEmpty)
                             
                             Button(action: {
                                 viewModel.simulateMatch()
@@ -128,15 +130,15 @@ struct OnboardingView: View {
             }
             
             if !viewModel.pdfStatusMessage.isEmpty {
-                if viewModel.pdfStatusMessage.contains("❌") {
-                    Text(viewModel.pdfStatusMessage)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(Color.red)
-                } else {
-                    Text(viewModel.pdfStatusMessage)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(accentColor)
-                }
+                Text(viewModel.pdfStatusMessage)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(accentColor)
+            }
+            
+            if !viewModel.errorMessage.isEmpty {
+                Text(viewModel.errorMessage)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.red)
             }
             
             // Allow manual bypass
@@ -268,6 +270,24 @@ struct OnboardingView: View {
         }
     }
     
+    private var targetSecuredLoadingView: some View {
+        VStack(spacing: 20) {
+            ProgressView()
+                .tint(accentColor)
+                .scaleEffect(1.4)
+            Text("TARGET SECURED")
+                .font(.system(.title2, design: .monospaced))
+                .fontWeight(.black)
+                .foregroundColor(.white)
+            Text("Routing dossier through Atlas vector search and assembling the live mission with Gemini.")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.gray)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    
     private func matchFoundView(session: GameSession) -> some View {
         VStack(spacing: 30) {
             Image(systemName: "link")
@@ -281,13 +301,19 @@ struct OnboardingView: View {
                 .kerning(2)
             
             VStack(spacing: 12) {
-                Text("ASSET: P\(session.playerBId.prefix(4).uppercased())")
+                Text("ASSET: P\(session.playerB_Id.prefix(4).uppercased())")
                     .font(.system(.body, design: .monospaced))
                     .foregroundColor(.gray)
                 
-                Text(session.topic.uppercased())
+                Text(session.trackTopic.uppercased())
                     .font(.system(.headline, design: .monospaced))
                     .foregroundColor(accentColor)
+                
+                if let role = session.peerSuggestedRole {
+                    Text("COMPLEMENTARY ROLE: \(role.uppercased())")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.gray)
+                }
                 
                 // Communicate Status
                 HStack(spacing: 8) {

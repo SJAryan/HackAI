@@ -20,13 +20,23 @@ const io = new Server(server, {
 });
 
 const port = process.env.PORT || 3000;
-const mongoUri = process.env.MONGODB_URI || "YOUR_MONGODB_ATLAS_URI";
-const hfToken = process.env.HF_TOKEN || "YOUR_HUGGINGFACE_TOKEN";
+const mongoUri = process.env.MONGODB_URI;
+const hfToken = process.env.HF_TOKEN;
+
+if (!mongoUri) {
+    console.error("MONGODB_URI is not set. Please add it to your .env file.");
+    process.exit(1);
+}
+
+if (!hfToken) {
+    console.error("HF_TOKEN is not set. Please add it to your .env file.");
+    process.exit(1);
+}
 
 const client = new MongoClient(mongoUri);
 const hf = new HfInference(hfToken);
+const databaseName = 'SynapseDB';
 
-// Connect to MongoDB Atlas
 async function connectDB() {
     try {
         await client.connect();
@@ -37,7 +47,6 @@ async function connectDB() {
 }
 connectDB();
 
-// HELPER: Generate vector embeddings from English text using an open HuggingFace model
 async function generateEmbedding(text) {
     const response = await hf.featureExtraction({
         model: "sentence-transformers/all-MiniLM-L6-v2",
@@ -46,40 +55,44 @@ async function generateEmbedding(text) {
     return response;
 }
 
-// POST /match
-// Takes a fresh user bio, embeds it, and finds a COMPLEMENTARY peer
+function buildAtlasSearchText(dossier) {
+    const skills = Array.isArray(dossier.currentSkills) ? dossier.currentSkills.join(', ') : '';
+    const interests = Array.isArray(dossier.futureInterests) ? dossier.futureInterests.join(', ') : '';
+    return `Current skills: ${skills}. Future interests: ${interests}. Suggested role: ${dossier.suggestedRole}. Track mastery: ${dossier.trackMastery}/5.`;
+}
+
 app.post('/match', async (req, res) => {
     try {
-        const { userId, skills, interests, role, trackMastery } = req.body;
-        
-        if (!interests || !role) {
-            return res.status(400).json({ error: "Missing interests or role for matchmaking" });
+        const dossier = req.body;
+
+        if (!dossier.id || !Array.isArray(dossier.currentSkills) || !Array.isArray(dossier.futureInterests) || !dossier.suggestedRole) {
+            return res.status(400).json({
+                status: "error",
+                message: "Invalid dossier payload"
+            });
         }
 
-        console.log(`Generating embedding for Operative ${userId} using Target Interests...`);
-        // We only embed interests because we want a Vector Search for someone wanting to learn the SAME thing
-        const userEmbedding = await generateEmbedding(interests);
+        const searchText = buildAtlasSearchText(dossier);
+        console.log(`Generating embedding for operative ${dossier.id}...`);
+        const userEmbedding = await generateEmbedding(searchText);
 
-        const database = client.db('SynapseDB');
+        const database = client.db(databaseName);
         const profiles = database.collection('profiles');
 
-        // 1. Save the new user's profile and embedding
         await profiles.updateOne(
-            { userId: userId },
-            { $set: { 
-                skills, 
-                interests, 
-                primaryRole: role, 
-                embedding: userEmbedding, 
-                masteryLevel: trackMastery || 3 
-            }},
+            { id: dossier.id },
+            {
+                $set: {
+                    ...dossier,
+                    searchText,
+                    embedding: userEmbedding,
+                    updatedAt: new Date()
+                }
+            },
             { upsert: true }
         );
 
-        // 2. Perform $vectorSearch to find a complementary peer
-        // The bio sent is a "Rich Profile String" (Skills + Future Interests + Mastery).
-        // It maximizes semantic similarity on their target domains, while the filter isolates complementary roles.
-        console.log(`Searching for complementary peer via Atlas Pipeline...`);
+        console.log(`Searching for complementary peer via Atlas vector search...`);
         const agg = [
             {
                 "$vectorSearch": {
@@ -87,9 +100,13 @@ app.post('/match', async (req, res) => {
                     "path": "embedding",
                     "queryVector": userEmbedding,
                     "numCandidates": 100,
-                    "limit": 5,
-                    // The core hack: Finding common interests but filtering out people with the exact same role
-                    "filter": { "primaryRole": { "$ne": role } }
+                    "limit": 10,
+                    "filter": {
+                        "$and": [
+                            { "suggestedRole": { "$ne": dossier.suggestedRole } },
+                            { "id": { "$ne": dossier.id } }
+                        ]
+                    }
                 }
             },
             {
@@ -106,39 +123,40 @@ app.post('/match', async (req, res) => {
             const bestMatch = matchingPeers[0];
             res.json({
                 status: "success",
-                message: "Matched successfully!",
-                peerId: bestMatch.userId,
-                peerBio: `Role: ${bestMatch.primaryRole} | Skills: ${bestMatch.skills} | Interests: ${bestMatch.interests}`,
-                matchScore: bestMatch.score,
-                peerMastery: bestMatch.masteryLevel || 3
+                message: "Target secured.",
+                peerId: bestMatch.id,
+                peerRole: bestMatch.suggestedRole,
+                peerSummary: `Role: ${bestMatch.suggestedRole}. Skills: ${(bestMatch.currentSkills || []).join(', ')}. Interests: ${(bestMatch.futureInterests || []).join(', ')}`,
+                trackTopic: dossier.futureInterests[0] || "Prompt Engineering",
+                matchScore: bestMatch.score
             });
         } else {
             res.json({
                 status: "waiting",
-                message: "Saved to matchmaking pool. Waiting for complementary peer."
+                message: "Dossier stored in the matchmaking pool. Waiting for a complementary operative."
             });
         }
 
     } catch (err) {
         console.error("Matchmaking Error:", err);
-        res.status(500).json({ error: "Matchmaking failed" });
+        res.status(500).json({
+            status: "error",
+            message: "Matchmaking failed"
+        });
     }
 });
 
-// POST /forge
-// Saves a Gemini-generated GameSession module to the community database
 app.post('/forge', async (req, res) => {
     try {
         const moduleData = req.body;
         
-        if (!moduleData.topic || !moduleData.clues) {
+        if (!moduleData.trackTopic || !Array.isArray(moduleData.clues)) {
             return res.status(400).json({ error: "Invalid module data" });
         }
 
-        const database = client.db('SynapseDB');
+        const database = client.db(databaseName);
         const modules = database.collection('modules');
 
-        // Add initial community upvotes
         moduleData.upvotes = 0;
         moduleData.createdAt = new Date();
 
@@ -155,31 +173,22 @@ app.post('/forge', async (req, res) => {
     }
 });
 
-// --- WEB SOCKETS: ASYMMETRIC GAME LOBBY ---
 io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // Join a specific game session room
     socket.on('joinRoom', ({ sessionId, userId }) => {
         socket.join(sessionId);
         console.log(`User ${userId} joined session ${sessionId}`);
-        
-        // Let the other player know someone joined
         socket.to(sessionId).emit('playerJoined', { userId });
     });
 
-    // When the INTEL player reveals a clue
     socket.on('revealClue', ({ sessionId, clueIndex }) => {
         console.log(`Clue ${clueIndex} revealed in session ${sessionId}`);
         io.to(sessionId).emit('clueRevealed', { clueIndex });
     });
 
-    // When the CONTROLS player submits an answer
     socket.on('submitAnswer', ({ sessionId, answer }) => {
         console.log(`Answer "${answer}" submitted in session ${sessionId}`);
-        
-        // In a real app we'd validate against the database, but for the hackathon
-        // we bounce it back to both players so they can transition to the Debrief
         io.to(sessionId).emit('answerAttempted', { answer });
     });
 

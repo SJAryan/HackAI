@@ -14,6 +14,7 @@ class MissionStateManager: ObservableObject {
     
     @Published var currentPhase: MissionPhase = .welcome
     @AppStorage("hasSeenBriefing") private var hasSeenBriefing = false
+    @AppStorage(AppRuntime.demoModeKey) var demoMode = true
     
     private init() {
         if hasSeenBriefing {
@@ -40,5 +41,9 @@ class MissionStateManager: ObservableObject {
     
     func restart() {
         currentPhase = .onboarding
+    }
+    
+    func toggleDemoMode() {
+        demoMode.toggle()
     }
 }

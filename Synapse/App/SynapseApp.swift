@@ -15,9 +15,9 @@ struct SynapseApp: App {
                 case .activeMission(let session):
                     ActiveMissionView(viewModel: ActiveMissionViewModel(session: session))
                 case .debrief(let session):
-                    ProfileDebriefView(session: session)
+                    DebriefView(session: session)
                 case .forge:
-                    ForgeView()
+                    TheForgeView()
                 }
             }
         }

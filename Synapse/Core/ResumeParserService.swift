@@ -1,36 +1,70 @@
 import Foundation
+import PDFKit
 
-struct ParsedDossier: Codable {
-    let currentSkills: [String]
-    let futureInterests: [String]
-    let suggestedRole: String
-}
-
-class ResumeParserService {
+final class ResumeParserService {
     static let shared = ResumeParserService()
     
-    // We can reuse the Gemini API Key from GeminiService, but for independence we define it here,
-    // or ideally fetch it from a secure environment/plist.
-    private let apiKey = "AIzaSyDQ_LUqzbCaUp2zRiCKzdSfYJ7iBbNz8iY"
+    private let apiKey: String?
     private let baseUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash:generateContent"
     
-    func parseResume(pdfText: String) async throws -> ParsedDossier {
-        guard let url = URL(string: "\(baseUrl)?key=\(apiKey)") else {
-            throw URLError(.badURL)
+    private init() {
+        self.apiKey = GeminiService.configuredAPIKey
+    }
+    
+    func extractText(from url: URL) throws -> String {
+        guard url.startAccessingSecurityScopedResource() else {
+            throw CocoaError(.fileReadNoPermission)
         }
         
+        defer {
+            url.stopAccessingSecurityScopedResource()
+        }
+        
+        guard let document = PDFDocument(url: url) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        
+        var fullText = ""
+        for pageIndex in 0..<document.pageCount {
+            if let page = document.page(at: pageIndex), let text = page.string {
+                fullText += text + "\n"
+            }
+        }
+        
+        return fullText
+    }
+    
+    func parseResume(pdfText: String) async throws -> UserDossier {
+        guard let apiKey, !apiKey.isEmpty else {
+            throw GeminiServiceError.missingAPIKey
+        }
+        let truncatedText = String(pdfText.prefix(20_000))
         let systemPrompt = """
-        You are an expert operative handler. Extract the candidate's data from the following resume text. Return a JSON object with exactly three keys: 'currentSkills' (array of strings, max 5), 'futureInterests' (array of strings, max 3), and 'suggestedRole' (a single string categorizing their primary domain, such as 'Management & Strategy', 'Backend Engineering', etc.).
+        You are an expert dossier analyst for SYNAPSE.
+        Read the resume text and return ONLY valid JSON matching this schema:
+        {
+          "id": "uuid",
+          "currentSkills": ["skill 1", "skill 2", "skill 3"],
+          "futureInterests": ["interest 1", "interest 2", "interest 3"],
+          "suggestedRole": "Backend Engineering",
+          "trackMastery": 3
+        }
+        Rules:
+        - Keep currentSkills to 3-6 concise items.
+        - Infer futureInterests from the candidate's projects, goals, and trajectory.
+        - suggestedRole must be a short category label.
+        - trackMastery must be an integer from 1 to 5.
         """
         
-        // Truncate text if it's absurdly long, though Gemini 1.5/3.1 has a huge context window
-        let truncatedText = String(pdfText.prefix(20000))
-        
         let requestBody = GeminiRequest(
-            contents: [GeminiContent(role: "user", parts: [GeminiPart(text: "Extract intelligence from this dossier:\\n\\(truncatedText)")])],
+            contents: [GeminiContent(role: "user", parts: [GeminiPart(text: "Analyze this resume text:\n\(truncatedText)")])],
             systemInstruction: GeminiSystemInstruction(parts: [GeminiPart(text: systemPrompt)]),
             generationConfig: GeminiGenerationConfig(temperature: 0.2, responseMimeType: "application/json")
         )
+        
+        guard let url = URL(string: "\(baseUrl)?key=\(apiKey)") else {
+            throw URLError(.badURL)
+        }
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -41,22 +75,16 @@ class ResumeParserService {
         
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
-            let errorText = String(data: data, encoding: .utf8) ?? "Unknown"
-            print("Gemini API Error Response: \\(errorText)")
+            print("Resume parser Gemini error: \(String(data: data, encoding: .utf8) ?? "Unknown")")
             throw URLError(.badServerResponse)
         }
         
         let geminiResponse = try JSONDecoder().decode(GeminiResponse.self, from: data)
-        
-        guard let responseText = geminiResponse.candidates.first?.content.parts.first?.text else {
+        guard let responseText = geminiResponse.candidates.first?.content.parts.first?.text,
+              let jsonData = responseText.data(using: .utf8) else {
             throw URLError(.cannotParseResponse)
         }
         
-        guard let jsonData = responseText.data(using: .utf8) else {
-            throw URLError(.cannotDecodeContentData)
-        }
-        
-        let parsedData = try JSONDecoder().decode(ParsedDossier.self, from: jsonData)
-        return parsedData
+        return try JSONDecoder().decode(UserDossier.self, from: jsonData)
     }
 }
